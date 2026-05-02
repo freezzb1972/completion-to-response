@@ -296,3 +296,7 @@ go run ./cmd/server -url http://localhost:11434/v1/chat/completions
 ## License
 
 MIT
+
+---
+
+*本项目由 AI 构建 — 使用 [Claude Code](https://claude.ai/code) 和 [GLM-5](https://open.bigmodel.cn/) 驱动。*

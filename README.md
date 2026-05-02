@@ -296,3 +296,7 @@ go run ./cmd/server -url http://localhost:11434/v1/chat/completions
 ## License
 
 MIT
+
+---
+
+*This project was built with AI — powered by [Claude Code](https://claude.ai/code) and [GLM-5](https://open.bigmodel.cn/).*
