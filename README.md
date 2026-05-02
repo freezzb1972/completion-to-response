@@ -38,11 +38,40 @@ Codex / Claude Code          completion-to-response              Your Backend
 
 ## Quick Start
 
-```bash
-# Build
-go build -o completion-to-response ./cmd/server
+### Download Binary
 
-# Run with any OpenAI-compatible backend
+Grab the latest release for your platform from [GitHub Releases](https://github.com/NoahStepheno/completion-to-response/releases/latest):
+
+```bash
+# macOS (Apple Silicon)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-darwin-arm64
+
+# macOS (Intel)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-darwin-amd64
+
+# Linux (x86_64)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-amd64
+
+# Linux (ARM64)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-arm64
+
+# Windows (x86_64)
+curl -L -o completion-to-response.exe https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-windows-amd64.exe
+
+chmod +x completion-to-response
+```
+
+### Or Build from Source
+
+```bash
+git clone https://github.com/NoahStepheno/completion-to-response.git
+cd completion-to-response
+go build -o completion-to-response ./cmd/server
+```
+
+### Run
+
+```bash
 ./completion-to-response \
   -url https://api.openai.com/v1/chat/completions \
   -model gpt-4o

@@ -38,11 +38,40 @@ Codex / Claude Code          completion-to-response              你的后端
 
 ## 快速开始
 
-```bash
-# 编译
-go build -o completion-to-response ./cmd/server
+### 下载二进制文件
 
-# 启动，指向任意 OpenAI 兼容后端
+从 [GitHub Releases](https://github.com/NoahStepheno/completion-to-response/releases/latest) 下载对应平台的产物：
+
+```bash
+# macOS (Apple Silicon)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-darwin-arm64
+
+# macOS (Intel)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-darwin-amd64
+
+# Linux (x86_64)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-amd64
+
+# Linux (ARM64)
+curl -L -o completion-to-response https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-arm64
+
+# Windows (x86_64)
+curl -L -o completion-to-response.exe https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-windows-amd64.exe
+
+chmod +x completion-to-response
+```
+
+### 或者从源码编译
+
+```bash
+git clone https://github.com/NoahStepheno/completion-to-response.git
+cd completion-to-response
+go build -o completion-to-response ./cmd/server
+```
+
+### 运行
+
+```bash
 ./completion-to-response \
   -url https://api.openai.com/v1/chat/completions \
   -model gpt-4o
