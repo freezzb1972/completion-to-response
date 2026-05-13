@@ -1,0 +1,193 @@
+#!/bin/bash
+# Codex Proxy — 多后端智能路由
+#
+# Usage:
+#   ./codex-proxy              # 启动，后端由 model_map 决定
+#   ./codex-proxy stop         # 停止
+#   ./codex-proxy status       # 查看状态
+#   ./codex-proxy list         # 列出可用后端和模型映射
+
+set -e
+
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BIN="$DIR/completion-to-response"
+GATEWAY="$DIR/codex-gateway.js"
+SWITCH="$DIR/codex-switch.toml"
+FRONT_PORT="${PROXY_PORT:-8082}"
+HOST="${HOST:-127.0.0.1}"
+
+# ---- 从 TOML 读取后端配置 ----
+parse_backend() {
+    local backend="$1"
+    local section="[backends.$backend]"
+    local found=false
+    local base_url="" model="" api_key=""
+    while IFS= read -r line; do
+        [[ "$line" == "[backends."* ]] && { [[ "$line" == "$section" ]] && found=true || found=false; }
+        $found || continue
+        [[ "$line" =~ ^base_url[[:space:]]*=[[:space:]]*\"(.+)\" ]] && base_url="${BASH_REMATCH[1]}"
+        [[ "$line" =~ ^model[[:space:]]*=[[:space:]]*\"(.+)\" ]] && model="${BASH_REMATCH[1]}"
+        [[ "$line" =~ ^api_key[[:space:]]*=[[:space:]]*\"(.+)\" ]] && api_key="${BASH_REMATCH[1]}"
+    done < "$SWITCH"
+    echo "$base_url|$model|$api_key"
+}
+
+build_chat_url() {
+    local base="$1"
+    [[ "$base" == */chat/completions ]] && echo "$base" && return
+    [[ "$base" == */v1 ]] && echo "${base}/chat/completions" && return
+    echo "${base%/}/v1/chat/completions"
+}
+
+# ---- 解析 model_map → JSON ----
+parse_model_map() {
+    local in_section=false
+    declare -A backend_ports
+    local next_port=8083
+    local model_entries=()
+    local backend_keys_json=""
+    local backend_ports_json=""
+
+    while IFS= read -r line; do
+        [[ "$line" == "[model_map]" ]] && { in_section=true; continue; }
+        [[ "$line" == "["* ]] && { in_section=false; continue; }
+        $in_section || continue
+
+        # 格式: "codex_model" = "backend:backend_model"
+        if [[ "$line" =~ ^[[:space:]]*\"(.+)\"[[:space:]]*=[[:space:]]*\"(.+):(.+)\" ]]; then
+            local codex_m="${BASH_REMATCH[1]}"
+            local backend="${BASH_REMATCH[2]}"
+            local backend_m="${BASH_REMATCH[3]}"
+
+            # 分配端口
+            if [ -z "${backend_ports[$backend]}" ]; then
+                backend_ports[$backend]=$next_port
+                next_port=$((next_port + 1))
+            fi
+
+            model_entries+=("\"$codex_m\":{\"b\":\"$backend\",\"m\":\"$backend_m\"}")
+        fi
+    done < "$SWITCH"
+
+    # 构建 model_map JSON
+    local IFS=","
+    echo "{${model_entries[*]}}"  # stdout line 1: model_map JSON
+
+    # 构建 backends 和 keys JSON
+    local be_entries=()
+    local bk_entries=()
+    for be in "${!backend_ports[@]}"; do
+        be_entries+=("\"$be\":\"${backend_ports[$be]}\"")
+        local info=$(parse_backend "$be")
+        local api_key="${info##*|}"
+        bk_entries+=("\"$be\":\"$api_key\"")
+        echo "BACKEND $be ${backend_ports[$be]} ${info%%|*} $api_key" >&2
+    done
+    local IFS=","
+    echo "{${be_entries[*]}}"   # stdout line 2: backends JSON
+    echo "{${bk_entries[*]}}"  # stdout line 3: backend_keys JSON
+}
+
+# ---- 参数处理 ----
+ARG="${1:-}"
+
+if [ "$ARG" = "stop" ]; then
+    echo "Stopping codex proxy..."
+    fuser -k "$FRONT_PORT/tcp" 2>/dev/null || true
+    for pid in $(pgrep -f "completion-to-response" 2>/dev/null || true); do kill "$pid" 2>/dev/null || true; done
+    pkill -f "codex-gateway.js" 2>/dev/null || true
+    echo "Stopped."
+    exit 0
+fi
+
+if [ "$ARG" = "status" ]; then
+    if fuser "$FRONT_PORT/tcp" 2>/dev/null; then
+        echo "gateway running on :$FRONT_PORT"
+        curl -s "http://127.0.0.1:$FRONT_PORT/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+    else
+        echo "not running"
+    fi
+    exit 0
+fi
+
+if [ "$ARG" = "list" ]; then
+    echo "Backends:"
+    grep '^\[backends\.' "$SWITCH" | sed 's/\[backends\.\(.*\)\]/  \1/' || true
+    echo ""
+    echo "Model Map:"
+    grep -E '^\s*\"gpt' "$SWITCH" | sed 's/^\s*/  /' || true
+    exit 0
+fi
+
+if [ ! -f "$BIN" ]; then
+    echo "Binary not found: $BIN"
+    exit 1
+fi
+
+# ---- 解析 model_map ----
+echo "=== Codex Proxy ==="
+echo "Parsing model_map..."
+stdout_file=$(mktemp)
+stderr_file=$(mktemp)
+parse_model_map >"$stdout_file" 2>"$stderr_file"
+MODEL_MAP_JSON=$(head -1 "$stdout_file")
+BACKENDS_JSON=$(head -2 "$stdout_file" | tail -1)
+BACKEND_KEYS_JSON=$(head -3 "$stdout_file" | tail -1)
+
+echo "Model map:  $MODEL_MAP_JSON"
+echo "Backends:   $BACKENDS_JSON"
+
+# ---- 先杀旧进程 ----
+fuser -k "$FRONT_PORT/tcp" 2>/dev/null || true
+for pid in $(pgrep -f "completion-to-response" 2>/dev/null || true); do kill "$pid" 2>/dev/null || true; done
+sleep 0.3
+
+# ---- 启动每个后端的 converter ----
+echo ""
+while IFS= read -r line; do
+    [[ "$line" == "BACKEND "* ]] || continue
+    read -r _ be_name be_port be_base_url be_api_key <<< "$line"
+
+    be_url=$(build_chat_url "$be_base_url")
+    be_default_model=$(echo "$MODEL_MAP_JSON" | python3 -c "import sys,json; m=json.load(sys.stdin); v=[v['m'] for v in m.values() if v['b']=='$be_name']; print(v[0] if v else 'default')" 2>/dev/null)
+    [ -z "$be_default_model" ] && be_default_model="default"
+
+    echo "[proxy] starting $be_name converter on :$be_port → $be_url"
+    nohup "$BIN" -url "$be_url" -default-model "$be_default_model" -key "$be_api_key" -port "$be_port" > "/tmp/codex-converter-$be_name.log" 2>&1 &
+    sleep 0.4
+    if ! kill -0 $! 2>/dev/null; then
+        echo "ERROR: $be_name converter failed. Log:"
+        cat "/tmp/codex-converter-$be_name.log"
+        exit 1
+    fi
+done < "$stderr_file"
+rm -f "$stdout_file" "$stderr_file"
+
+# ---- 启动网关 ----
+echo "[proxy] starting gateway on :$FRONT_PORT ..."
+PROXY_HOST=$HOST PROXY_PORT=$FRONT_PORT \
+  MODEL_MAP="$MODEL_MAP_JSON" \
+  BACKENDS="$BACKENDS_JSON" \
+  BACKEND_KEYS="$BACKEND_KEYS_JSON" \
+  nohup node "$GATEWAY" > /tmp/codex-gateway.log 2>&1 &
+GATE_PID=$!
+
+sleep 0.5
+if ! kill -0 $GATE_PID 2>/dev/null; then
+    echo "ERROR: gateway failed. Log:"
+    cat /tmp/codex-gateway.log
+    exit 1
+fi
+
+# ---- 验证 ----
+sleep 0.3
+if curl -s "http://127.0.0.1:$FRONT_PORT/health" | grep -q ok; then
+    echo ""
+    echo "[proxy] ✓ ready — http://127.0.0.1:$FRONT_PORT"
+    echo "[proxy] Codex base URL: http://127.0.0.1:$FRONT_PORT/v1"
+    echo "[proxy] stop: $0 stop"
+else
+    echo "[proxy] ✗ health check failed"
+    cat /tmp/codex-gateway.log
+    exit 1
+fi

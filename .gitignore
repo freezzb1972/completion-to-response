@@ -13,3 +13,6 @@
 
 # Environment
 .env
+
+# Config with secrets
+codex-switch.toml

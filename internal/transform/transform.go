@@ -74,20 +74,108 @@ func buildMessages(input interface{}, instructions string) []types.ChatCompletio
 		})
 	case []interface{}:
 		// Array of message objects (Responses API format)
-		for _, item := range v {
-			msg, ok := item.(map[string]interface{})
+		// Collect late system/developer messages separately to avoid
+		// breaking the assistant(tool_calls) → tool message sequence
+		var lateSystem []string
+		for i := 0; i < len(v); i++ {
+			msg, ok := v[i].(map[string]interface{})
 			if !ok {
 				continue
 			}
-			role, _ := msg["role"].(string)
-			// Map Responses API roles to Chat Completions roles
-			role = mapRole(role)
-			content := convertContent(msg["content"])
+			itemType, _ := msg["type"].(string)
 
-			messages = append(messages, types.ChatCompletionMessage{
-				Role:    role,
-				Content: content,
-			})
+			if itemType == "function_call" {
+				// Group consecutive function_call items into one assistant message
+				var toolCalls []types.ToolCall
+				var reasoningContent string
+				for j := i; j < len(v); j++ {
+					fc, ok := v[j].(map[string]interface{})
+					if !ok {
+						break
+					}
+					if fcType, _ := fc["type"].(string); fcType != "function_call" {
+						break
+					}
+					callID, _ := fc["call_id"].(string)
+					name, _ := fc["name"].(string)
+					args, _ := fc["arguments"].(string)
+					if reasoningContent == "" {
+						if summary, ok := fc["summary"].([]interface{}); ok && len(summary) > 0 {
+							if rc, ok := summary[0].(string); ok {
+								reasoningContent = rc
+							}
+						}
+					}
+					toolCalls = append(toolCalls, types.ToolCall{
+						ID:   callID,
+						Type: "function",
+						Function: types.FunctionCall{
+							Name:      name,
+							Arguments: args,
+						},
+					})
+					i = j
+				}
+				messages = append(messages, types.ChatCompletionMessage{
+					Role:             "assistant",
+					Content:          "",
+					ReasoningContent: reasoningContent,
+					ToolCalls:        toolCalls,
+				})
+				continue
+			}
+
+			switch itemType {
+
+			case "function_call_output":
+				// Convert tool output to tool message
+				callID, _ := msg["call_id"].(string)
+				output, _ := msg["output"].(string)
+				messages = append(messages, types.ChatCompletionMessage{
+					Role:       "tool",
+					ToolCallID: callID,
+					Content:    output,
+				})
+
+			default:
+				// Regular message (type "message" or no type)
+				role, _ := msg["role"].(string)
+				if mapRole(role) == "system" {
+					// Defer system messages to avoid breaking tool call sequences
+					if s, ok := convertContent(msg["content"]).(string); ok && s != "" {
+						lateSystem = append(lateSystem, s)
+					}
+					continue
+				}
+				role = mapRole(role)
+				if role == "" {
+					// Skip items with no recognizable role or type
+					continue
+				}
+				content := convertContent(msg["content"])
+				messages = append(messages, types.ChatCompletionMessage{
+					Role:    role,
+					Content: content,
+				})
+			}
+		}
+
+		// Merge late system messages into the first system message
+		if len(lateSystem) > 0 {
+			allSystem := strings.Join(lateSystem, "\n\n")
+			if len(messages) > 0 && messages[0].Role == "system" {
+				if messages[0].Content != "" {
+					messages[0].Content = messages[0].Content.(string) + "\n\n" + allSystem
+				} else {
+					messages[0].Content = allSystem
+				}
+			} else {
+				// Prepend system message
+				messages = append([]types.ChatCompletionMessage{{
+					Role:    "system",
+					Content: allSystem,
+				}}, messages...)
+			}
 		}
 	}
 
@@ -240,24 +328,38 @@ func ResponseFromCompletion(resp types.ChatCompletionResponse) types.ResponsesAP
 	return result
 }
 
+// toolCallState tracks accumulated tool call data across streaming chunks.
+type toolCallState struct {
+	ID     string
+	Name   string
+	argBuf strings.Builder
+	started bool
+}
+
 // StreamConverter maintains state across streaming chunks to generate
 // properly formatted Responses API SSE events.
 type StreamConverter struct {
-	respID  string
-	msgID   string
-	model   string
-	created int64
-	output  []types.OutputItem
-	textBuf strings.Builder
-	started bool
+	respID          string
+	msgID           string
+	model           string
+	created         int64
+	output          []types.OutputItem
+	textBuf         strings.Builder
+	reasoningBuf    strings.Builder
+	started         bool
+	toolStates      map[int]*toolCallState
+	toolUsed        bool
+	nextOutputIndex int // output index for next function_call item (1+)
 }
 
 // NewStreamConverter creates a new stateful stream converter.
 func NewStreamConverter(model string) *StreamConverter {
 	return &StreamConverter{
-		respID: "resp_" + randomHex(16),
-		msgID:  "msg_" + randomHex(16),
-		model:  model,
+		respID:          "resp_" + randomHex(16),
+		msgID:           "msg_" + randomHex(16),
+		model:           model,
+		toolStates:      make(map[int]*toolCallState),
+		nextOutputIndex: 1, // 0 = message, function calls start at 1
 	}
 }
 
@@ -344,14 +446,53 @@ func (sc *StreamConverter) OnChunk(chunk types.ChatCompletionStreamChunk) [][]by
 		}))
 	}
 
-	// Tool call deltas
+	// Reasoning content delta (thinking mode)
+	if choice.Delta.ReasoningContent != "" {
+		sc.reasoningBuf.WriteString(choice.Delta.ReasoningContent)
+	}
+
+	// Tool call deltas — accumulate across chunks
 	for _, tc := range choice.Delta.ToolCalls {
-		if tc.Type == "function" && tc.Function.Arguments != "" {
+		idx := tc.Index
+		ts, ok := sc.toolStates[idx]
+		if !ok {
+			ts = &toolCallState{}
+			sc.toolStates[idx] = ts
+		}
+		if tc.ID != "" {
+			ts.ID = tc.ID
+		}
+		if tc.Function.Name != "" {
+			ts.Name = tc.Function.Name
+		}
+		if tc.Function.Arguments != "" {
+			if !ts.started {
+				ts.started = true
+				sc.toolUsed = true
+				if ts.ID == "" {
+					ts.ID = "fc_" + randomHex(16)
+				}
+				// emit response.output_item.added for function_call
+				fcOutputIndex := sc.nextOutputIndex
+				sc.nextOutputIndex++
+				events = append(events, mustMarshal(map[string]interface{}{
+					"type":         "response.output_item.added",
+					"output_index": fcOutputIndex,
+					"item": types.OutputItem{
+						ID:     ts.ID,
+						Type:   "function_call",
+						Status: "in_progress",
+						CallID: ts.ID,
+						Name:   ts.Name,
+					},
+				}))
+			}
+			ts.argBuf.WriteString(tc.Function.Arguments)
 			events = append(events, mustMarshal(map[string]interface{}{
-				"type":          "response.function_call_arguments.delta",
-				"output_index":  len(sc.output),
-				"item_id":       tc.ID,
-				"delta":         tc.Function.Arguments,
+				"type":         "response.function_call_arguments.delta",
+				"output_index": sc.nextOutputIndex - 1,
+				"item_id":      ts.ID,
+				"delta":        tc.Function.Arguments,
 			}))
 		}
 	}
@@ -388,7 +529,7 @@ func (sc *StreamConverter) OnChunk(chunk types.ChatCompletionStreamChunk) [][]by
 			},
 		}))
 
-		// response.output_item.done
+		// response.output_item.done for message
 		msgItem := types.OutputItem{
 			ID:     sc.msgID,
 			Type:   "message",
@@ -410,6 +551,43 @@ func (sc *StreamConverter) OnChunk(chunk types.ChatCompletionStreamChunk) [][]by
 
 		// Build final output for response.completed
 		output := []types.OutputItem{msgItem}
+
+		// Add function_call items from accumulated tool call state
+		for idx := 0; idx < len(sc.toolStates); idx++ {
+			ts, ok := sc.toolStates[idx]
+			if !ok || !ts.started {
+				continue
+			}
+		args := ts.argBuf.String()
+			reasoning := sc.reasoningBuf.String()
+			fcItem := types.OutputItem{
+				ID:        ts.ID,
+				Type:      "function_call",
+				Status:    "completed",
+				CallID:    ts.ID,
+				Name:      ts.Name,
+				Arguments: args,
+			}
+			if reasoning != "" {
+				fcItem.Summary = []interface{}{reasoning}
+			}
+			output = append(output, fcItem)
+
+			// response.function_call_arguments.done
+			events = append(events, mustMarshal(map[string]interface{}{
+				"type":         "response.function_call_arguments.done",
+				"output_index": len(output) - 1,
+				"item_id":      ts.ID,
+				"arguments":    args,
+			}))
+
+			// response.output_item.done for function_call
+			events = append(events, mustMarshal(map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": len(output) - 1,
+				"item":         fcItem,
+			}))
+		}
 
 		// response.completed with full response object
 		finalResp := types.ResponsesAPIResponse{

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codex Proxy 使用指南</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --orange: #d2991d;
+    --code-bg: #1c2128;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    max-width: 960px; margin: 0 auto; padding: 40px 20px;
+  }
+  h1 { font-size: 2em; border-bottom: 2px solid var(--border); padding-bottom: 12px; margin-bottom: 8px; }
+  h2 { font-size: 1.4em; margin: 32px 0 12px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 1.1em; margin: 20px 0 8px; color: var(--text); }
+  p, li { margin: 6px 0; }
+  a { color: var(--accent); }
+  ul, ol { padding-left: 24px; }
+  code {
+    background: var(--code-bg); padding: 1px 6px; border-radius: 4px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 16px; overflow-x: auto; margin: 10px 0;
+  }
+  pre code { background: none; padding: 0; }
+  .cmd { color: var(--green); }
+  .arg { color: var(--orange); }
+  .path { color: var(--accent); }
+  table {
+    width: 100%; border-collapse: collapse; margin: 12px 0;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 8px 12px; text-align: left;
+  }
+  th { background: var(--surface); font-weight: 600; }
+  tr:nth-child(even) { background: var(--surface); }
+  .note {
+    border-left: 3px solid var(--accent); background: var(--surface);
+    padding: 10px 14px; margin: 12px 0; border-radius: 0 6px 6px 0;
+  }
+  .warn {
+    border-left: 3px solid var(--orange); background: var(--surface);
+    padding: 10px 14px; margin: 12px 0; border-radius: 0 6px 6px 0;
+  }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 0.8em; font-weight: 600;
+  }
+  .tag-go { background: #00add8; color: #000; }
+  .tag-sh { background: #4eaa25; color: #000; }
+  .tag-js { background: #f0db4f; color: #000; }
+  .tag-toml { background: var(--orange); color: #000; }
+  .tag-binary { background: var(--accent); color: #000; }
+  .flow {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 16px; margin: 10px 0; text-align: center; font-family: monospace;
+    font-size: 0.95em; line-height: 2;
+  }
+  .flow .arrow { color: var(--green); }
+  .flow .box {
+    display: inline-block; border: 1px solid var(--accent); border-radius: 4px;
+    padding: 2px 10px; margin: 0 4px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Codex Proxy 使用指南</h1>
+<p style="color: var(--muted)">多后端智能路由 · Responses API → Chat Completions · 2026-05-13</p>
+
+<!-- ============================================================ -->
+<h2>1. 架构概述</h2>
+
+<p>Codex Proxy 是一个<strong>多后端智能路由代理</strong>，由两层组成：</p>
+
+<ul>
+  <li><strong>codex-gateway.js</strong>（Node.js 网关）— 接收 Codex CLI 请求，按模型名路由到不同后端</li>
+  <li><strong>completion-to-response</strong>（Go 二进制）— 每个后端一个实例，将 Responses API 转换为 Chat Completions</li>
+</ul>
+
+<div class="flow">
+  <span class="box">Codex CLI</span>
+  <span class="arrow">── :8082 ──▶</span>
+  <span class="box">codex-gateway.js</span>
+  <span class="arrow">── :8083 ──▶</span>
+  <span class="box">converter (DeepSeek)</span>
+  <span class="arrow">──▶</span>
+  <span class="box">api.deepseek.com</span>
+  <br>
+  <span style="visibility: hidden;">Codex CLI</span>
+  <span style="visibility: hidden;">── :8082 ──</span>
+  <span class="box" style="visibility: hidden;">codex-gateway.js</span>
+  <span class="arrow">── :8084 ──▶</span>
+  <span class="box">converter (NVIDIA)</span>
+  <span class="arrow">──▶</span>
+  <span class="box">integrate.api.nvidia.com</span>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. 文件清单</h2>
+
+<p>所有文件位于 <code class="path">/mnt/d/cc/tools/completion-to-response/</code>：</p>
+
+<table>
+  <tr><th>文件</th><th>说明</th></tr>
+  <tr>
+    <td><span class="tag tag-js">gateway</span> <code>codex-gateway.js</code></td>
+    <td>Node.js 网关：/v1/models、健康检查、模型映射、API Key 注入、多后端路由</td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-sh">launcher</span> <code>codex-proxy</code></td>
+    <td>Bash 启动器：解析 TOML、为每个后端启动 converter、启动网关</td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-toml">config</span> <code>codex-switch.toml</code></td>
+    <td>后端配置 + 模型映射表</td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-binary">binary</span> <code>completion-to-response</code></td>
+    <td>Go 编译的协议转换器，每个后端运行一个实例</td>
+  </tr>
+  <tr>
+    <td>文档 <code>codex-proxy-guide.html</code></td>
+    <td>本文件</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. 当前模型映射</h2>
+
+<table>
+  <tr><th>Codex 模型名</th><th>后端</th><th>实际模型</th><th>用途</th></tr>
+  <tr><td><code>gpt-5.5</code></td><td>DeepSeek</td><td><code>deepseek-v4-pro</code></td><td>最强推理（思考模式）</td></tr>
+  <tr><td><code>gpt-5.4</code></td><td>DeepSeek</td><td><code>deepseek-v4-flash</code></td><td>快速响应（思考模式）</td></tr>
+  <tr><td><code>gpt-5.1</code></td><td>NVIDIA 免费</td><td><code>meta/llama-3.1-8b-instruct</code></td><td>轻量快速</td></tr>
+  <tr><td><code>gpt-5.0</code></td><td>NVIDIA 免费</td><td><code>meta/llama-3.3-70b-instruct</code></td><td>复杂任务</td></tr>
+</table>
+
+<div class="note">
+  <strong>切换模型：</strong>在 Codex CLI 中更改模型名即可切换后端和实际模型，无需重启代理。
+</div>
+
+<!-- ============================================================ -->
+<h2>4. 安装</h2>
+
+<h3>下载 converter 二进制</h3>
+<pre><code><span class="cmd"># Linux amd64</span>
+curl -sL -o /mnt/d/cc/tools/completion-to-response/completion-to-response \
+  https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-amd64
+chmod +x /mnt/d/cc/tools/completion-to-response/completion-to-response</code></pre>
+
+<table>
+  <tr><th>平台</th><th>下载文件</th></tr>
+  <tr><td>Linux x86_64</td><td><code>completion-to-response-linux-amd64</code></td></tr>
+  <tr><td>Linux ARM64</td><td><code>completion-to-response-linux-arm64</code></td></tr>
+  <tr><td>macOS Apple Silicon</td><td><code>completion-to-response-darwin-arm64</code></td></tr>
+  <tr><td>macOS Intel</td><td><code>completion-to-response-darwin-amd64</code></td></tr>
+  <tr><td>Windows x86_64</td><td><code>completion-to-response-windows-amd64.exe</code></td></tr>
+</table>
+
+<h3>前置依赖</h3>
+<p>仅需 <code>node</code> 和 <code>bash</code>，均为系统自带。</p>
+
+<!-- ============================================================ -->
+<h2>5. 启动与停止</h2>
+
+<h3>WSL 终端</h3>
+<pre><code><span class="cmd"># 启动（读取 codex-switch.toml，自动为每个后端启动 converter + 网关）</span>
+codex-proxy
+
+<span class="cmd"># 停止 / 状态 / 列出</span>
+codex-proxy <span class="arg">stop</span>
+codex-proxy <span class="arg">status</span>
+codex-proxy <span class="arg">list</span>
+
+<span class="cmd"># 指定端口</span>
+PROXY_PORT=9090 codex-proxy</code></pre>
+
+<h3>Windows Win+R 一键启动</h3>
+<pre><code>codex-proxy          <span class="cmd"># 启动代理（WSL 后台运行）</span>
+codex-proxy stop     <span class="cmd"># 停止</span></code></pre>
+
+<div class="note">
+  <strong>说明：</strong>已在 Windows PATH 中加入 <code>C:\Users\zhuzhengbing\bin\codex-proxy.cmd</code>，<br>
+  该脚本调用 <code>wsl /mnt/d/cc/tools/completion-to-response/codex-proxy</code>，支持全部参数。<br>
+  WSL 内已在 <code>~/.bashrc</code> 中将目录加入 PATH，终端直接敲 <code>codex-proxy</code> 即可。
+</div>
+
+<!-- ============================================================ -->
+<h2>6. 配置：codex-switch.toml</h2>
+
+<h3>后端定义</h3>
+<pre><code><span class="cmd"># 格式</span>
+[backends.&lt;名称&gt;]
+base_url = "&lt;API 基础地址&gt;"
+api_key = "&lt;API Key&gt;"
+model = "&lt;默认模型&gt;"</code></pre>
+
+<table>
+  <tr><th>后端</th><th>base_url</th></tr>
+  <tr><td>deepseek</td><td><code>https://api.deepseek.com</code></td></tr>
+  <tr><td>nvidia</td><td><code>https://integrate.api.nvidia.com/v1</code></td></tr>
+  <tr><td>openai</td><td><code>https://api.openai.com/v1</code></td></tr>
+  <tr><td>custom</td><td><code>http://localhost:8081/v1</code></td></tr>
+</table>
+
+<div class="warn">
+  <strong>注意：</strong>base_url 不含 <code>/chat/completions</code> 后缀，启动器会自动拼接。<br>
+  如果 base_url 以 <code>/v1</code> 结尾，则拼接 <code>/chat/completions</code>；否则拼接 <code>/v1/chat/completions</code>。
+</div>
+
+<h3>模型映射</h3>
+<pre><code><span class="cmd"># 格式: "Codex模型名" = "后端名:后端模型名"</span>
+[model_map]
+"gpt-5.5" = "deepseek:deepseek-v4-pro"
+"gpt-5.4" = "deepseek:deepseek-v4-flash"
+"gpt-5.1" = "nvidia:meta/llama-3.1-8b-instruct"
+"gpt-5.0" = "nvidia:meta/llama-3.3-70b-instruct"
+"gpt-5.1" = "nvidia:meta/llama-3.1-8b-instruct"
+"gpt-5.0" = "nvidia:meta/llama-3.3-70b-instruct"
+
+<span class="cmd"># 添加新映射：先加到 model_map，再 ./codex-proxy 重启即可</span></code></pre>
+
+<!-- ============================================================ -->
+<h2>7. API 端点</h2>
+
+<table>
+  <tr><th>方法</th><th>端点</th><th>说明</th></tr>
+  <tr><td>GET</td><td><code>/v1/models</code></td><td>返回 Codex 可见的模型列表（model_map 的 key）</td></tr>
+  <tr><td>GET</td><td><code>/health</code></td><td>健康检查 + 当前 model_map / backends</td></tr>
+  <tr><td>POST</td><td><code>/v1/responses</code></td><td>Responses API → Chat Completions 转换并路由</td></tr>
+</table>
+
+<h3>Codex CLI 配置</h3>
+<pre><code>Base URL: http://127.0.0.1:8082/v1
+API Key:  anything（网关会替换为后端 Key，填任意值即可）
+Model:    gpt-5.5 / gpt-5.4 / gpt-5.1 / gpt-5.0</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. API Key 注入机制</h2>
+
+<p>Codex CLI 发送的是自己的 Key，<strong>不是</strong>后端 Key。网关的工作流程：</p>
+
+<ol>
+  <li>Codex CLI → 网关（携带 Codex 自己的 Key）</li>
+  <li>网关查找 model_map，确定目标后端</li>
+  <li>网关<strong>替换</strong> Authorization 头为后端 Key（从 codex-switch.toml 读取）</li>
+  <li>网关修改 body.model 为后端模型名</li>
+  <li>转发到对应后端的 converter 端口</li>
+</ol>
+
+<div class="note">
+  <strong>结论：</strong>Codex CLI 中填任意 Key 即可，真正的后端 Key 存在 codex-switch.toml 中，不暴露给 Codex。
+</div>
+
+<!-- ============================================================ -->
+<h2>9. 协议转换</h2>
+
+<h3>请求：Responses API → Chat Completions</h3>
+<table>
+  <tr><th>Responses API</th><th>Chat Completions</th></tr>
+  <tr><td><code>input[].role + input[].content</code></td><td><code>messages[].role + messages[].content</code></td></tr>
+  <tr><td><code>instructions</code></td><td>system 角色消息</td></tr>
+  <tr><td><code>tools[]</code></td><td><code>tools[]</code> 加 <code>{type:"function", function:{...}}</code> 包装</td></tr>
+  <tr><td><code>max_output_tokens</code></td><td><code>max_tokens</code></td></tr>
+</table>
+
+<h3>响应：Chat Completions → Responses API</h3>
+<table>
+  <tr><th>Chat Completions</th><th>Responses API</th></tr>
+  <tr><td><code>choices[].message.content</code></td><td><code>output[].content[].output_text</code></td></tr>
+  <tr><td><code>choices[].message.tool_calls</code></td><td><code>output[]</code> 中 <code>function_call</code> 项</td></tr>
+  <tr><td><code>finish_reason: "stop"</code></td><td><code>status: "completed"</code></td></tr>
+  <tr><td><code>finish_reason: "tool_calls"</code></td><td><code>status: "requires_action"</code></td></tr>
+  <tr><td><code>finish_reason: "length"</code></td><td><code>status: "incomplete"</code></td></tr>
+</table>
+
+<h3>SSE 流式事件序列</h3>
+<pre><code>Chat Completions SSE chunks
+        ↕
+response.created → response.in_progress
+→ response.output_item.added (message)
+→ response.content_part.added → response.output_text.delta (×N)
+→ response.output_text.done → response.content_part.done
+→ response.output_item.done (message)
+
+工具调用时:
+→ response.output_item.added (function_call)
+→ response.function_call_arguments.delta (×N)
+→ response.function_call_arguments.done
+→ response.output_item.done (function_call, 含 summary=reasoning_content)
+
+→ response.completed</code></pre>
+
+<!-- ============================================================ -->
+<h2>10. Codex CLI 使用示例</h2>
+
+<h3>基本使用</h3>
+<pre><code><span class="cmd"># 1. 启动代理</span>
+codex-proxy
+
+<span class="cmd"># 2. 配置 Codex CLI</span>
+<span class="cmd"># Base URL: http://127.0.0.1:8082/v1</span>
+<span class="cmd"># API Key:  anything（任意值）</span>
+<span class="cmd"># Model:    gpt-5.5</span>
+
+<span class="cmd"># 3. 在 Codex 中切换模型即切换后端：</span>
+<span class="cmd">#    gpt-5.5 → DeepSeek V4 Pro（最强推理）</span>
+<span class="cmd">#    gpt-5.4 → DeepSeek V4 Flash（快速响应）</span>
+<span class="cmd">#    gpt-5.1 → Llama 3.1 8B（轻量快速）</span>
+<span class="cmd">#    gpt-5.0 → Llama 3.3 70B（复杂任务）</span></code></pre>
+
+<h3>更换端口</h3>
+<pre><code>PROXY_PORT=9090 codex-proxy</code></pre>
+
+<!-- ============================================================ -->
+<h2>11. 故障排查</h2>
+
+<h3>代理无法启动</h3>
+<pre><code><span class="cmd"># 先停旧进程</span>
+codex-proxy stop
+<span class="cmd"># 再启动</span>
+codex-proxy</code></pre>
+
+<h3>模型路由失败</h3>
+<pre><code><span class="cmd"># 查看健康检查，确认 model_map 包含所用模型</span>
+curl http://127.0.0.1:8082/health
+
+<span class="cmd"># 查看模型列表</span>
+curl http://127.0.0.1:8082/v1/models</code></pre>
+
+<h3>后端返回错误</h3>
+<pre><code><span class="cmd"># 查看 converter 日志</span>
+cat /tmp/codex-converter-deepseek.log
+cat /tmp/codex-converter-nvidia.log
+
+<span class="cmd"># 查看网关日志</span>
+cat /tmp/codex-gateway.log</code></pre>
+
+<h3>NVIDIA 模型不可用</h3>
+<p>NVIDIA 免费 tier 模型列表会变化。用以下命令直接测试：</p>
+<pre><code><span class="cmd"># 直接调 NVIDIA converter（端口见启动日志，通常 8084）</span>
+curl -X POST http://127.0.0.1:8084/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"&lt;模型名&gt;","input":[{"role":"user","content":"hi"}],"stream":false}'</code></pre>
+
+<h3>"no backend for model" 错误</h3>
+<p>使用的 Codex 模型名不在 model_map 中。添加映射到 <code>codex-switch.toml</code> 的 <code>[model_map]</code> 段，然后重启代理。</p>
+
+<!-- ============================================================ -->
+<h2>12. 添加新模型映射</h2>
+
+<pre><code><span class="cmd"># 1. 编辑配置</span>
+vim /mnt/d/cc/tools/completion-to-response/codex-switch.toml
+
+<span class="cmd"># 在 [model_map] 中添加一行：</span>
+<span class="cmd"># "gpt-5.2" = "deepseek:deepseek-v4-pro"</span>
+
+<span class="cmd"># 2. 重启代理</span>
+codex-proxy stop
+codex-proxy
+
+<span class="cmd"># 3. 验证</span>
+curl http://127.0.0.1:8082/v1/models  <span class="cmd"># 应包含 gpt-5.2</span></code></pre>
+
+<!-- ============================================================ -->
+<h2>13. 快速参考</h2>
+
+<pre><code><span class="cmd"># 安装</span>
+curl -sL -o /mnt/d/cc/tools/completion-to-response/completion-to-response \
+  https://github.com/NoahStepheno/completion-to-response/releases/latest/download/completion-to-response-linux-amd64
+chmod +x /mnt/d/cc/tools/completion-to-response/completion-to-response
+
+<span class="cmd"># 启动 / 停止 / 状态</span>
+codex-proxy
+codex-proxy <span class="arg">stop</span>
+codex-proxy <span class="arg">status</span>
+codex-proxy <span class="arg">list</span>
+
+<span class="cmd"># 健康检查</span>
+curl http://127.0.0.1:8082/health
+
+<span class="cmd"># 模型列表</span>
+curl http://127.0.0.1:8082/v1/models
+
+<span class="cmd"># 日志</span>
+cat /tmp/codex-gateway.log
+cat /tmp/codex-converter-deepseek.log
+cat /tmp/codex-converter-nvidia.log
+
+<span class="cmd"># 更换端口</span>
+PROXY_PORT=9090 codex-proxy</code></pre>
+
+<!-- ============================================================ -->
+<h2>14. 修复记录</h2>
+
+<h3>2026-05-13 — DeepSeek V4 思考模式兼容</h3>
+
+<h4>修复 1：流式工具调用丢失</h4>
+<p>原因：DeepSeek 流式工具调用分两个阶段 — 第一个 chunk 含 <code>id</code>/<code>type</code>/<code>name</code> 但 <code>arguments</code> 为空，后续 chunk 只含 <code>arguments</code> 不含 <code>type</code>。转换器原有逻辑要求 <code>type==&quot;function&quot; &amp;&amp; arguments!=&quot;&quot;</code>，导致两个阶段都被跳过。</p>
+<p>修复：添加 <code>toolCallState</code> 跨 chunk 累积状态，按 <code>index</code> 跟踪每个工具调用。首次遇到时记录 <code>id</code>/<code>name</code>，后续 chunk 累积 <code>arguments</code> 并发送 delta 事件。流式结束时创建 <code>function_call</code> 输出项。</p>
+
+<h4>修复 2：多轮对话空 role 错误</h4>
+<p>原因：<code>buildMessages</code> 函数未处理 <code>input</code> 数组中的 <code>function_call</code>（工具调用）和 <code>function_call_output</code>（工具结果）项，导致空 role 传给后端。</p>
+<p>修复：添加 <code>function_call</code> → 助手消息（含 tool_calls）转换；添加 <code>function_call_output</code> → 工具角色消息转换。</p>
+
+<h4>修复 3：reasoning_content 传递</h4>
+<p>原因：DeepSeek V4 思考模式要求多轮对话中传递 <code>reasoning_content</code>，否则报错 &quot;must be passed back to the API&quot;。</p>
+<p>修复：流式转换器累积 <code>reasoning_content</code> 并存入 <code>function_call</code> 输出项的 <code>summary</code> 字段。后续请求中从 <code>summary</code> 提取 reasoning_content 并传递给后端。</p>
+
+<hr style="border-color: var(--border); margin: 32px 0 16px;">
+<p style="color: var(--muted); font-size: 0.85em;">
+  GitHub: <a href="https://github.com/NoahStepheno/completion-to-response">NoahStepheno/completion-to-response</a> ·
+  License: MIT
+</p>
+
+</body>
+</html>

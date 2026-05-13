@@ -147,6 +147,25 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[DEBUG] Forwarding to backend (%s): %s", s.cfg.BackendURL, trunc(prettyJSON(compBody), 4096))
+	for i, m := range compReq.Messages {
+		tc := len(m.ToolCalls)
+		tcid := m.ToolCallID
+		clen := 0
+		if s, ok := m.Content.(string); ok {
+			clen = len(s)
+		}
+		if tc > 0 {
+			names := make([]string, tc)
+			for j, t := range m.ToolCalls {
+				names[j] = t.Function.Name
+			}
+			log.Printf("[DEBUG] MSG[%d] %s tool_calls=%v rc_len=%d", i, m.Role, names, len(m.ReasoningContent))
+		} else if tcid != "" {
+			log.Printf("[DEBUG] MSG[%d] %s tool_call_id=%s clen=%d", i, m.Role, tcid, clen)
+		} else {
+			log.Printf("[DEBUG] MSG[%d] %s clen=%d rc_len=%d", i, m.Role, clen, len(m.ReasoningContent))
+		}
+	}
 
 	if req.Stream {
 		s.handleStream(w, r, compReq)
