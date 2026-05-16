@@ -94,7 +94,8 @@ ARG="${1:-}"
 if [ "$ARG" = "stop" ]; then
     echo "Stopping codex proxy..."
     fuser -k "$FRONT_PORT/tcp" 2>/dev/null || true
-    for pid in $(pgrep -f "completion-to-response" 2>/dev/null || true); do kill "$pid" 2>/dev/null || true; done
+    self=$$
+    for pid in $(pgrep -f "completion-to-response" 2>/dev/null | grep -v "^$self$" || true); do kill "$pid" 2>/dev/null || true; done
     pkill -f "codex-gateway.js" 2>/dev/null || true
     echo "Stopped."
     exit 0
@@ -139,7 +140,8 @@ echo "Backends:   $BACKENDS_JSON"
 
 # ---- 先杀旧进程 ----
 fuser -k "$FRONT_PORT/tcp" 2>/dev/null || true
-for pid in $(pgrep -f "completion-to-response" 2>/dev/null || true); do kill "$pid" 2>/dev/null || true; done
+self=$$
+for pid in $(pgrep -f "completion-to-response" 2>/dev/null | grep -v "^$self$" || true); do kill "$pid" 2>/dev/null || true; done
 sleep 0.3
 
 # ---- 启动每个后端的 converter ----
@@ -153,7 +155,7 @@ while IFS= read -r line; do
     [ -z "$be_default_model" ] && be_default_model="default"
 
     echo "[proxy] starting $be_name converter on :$be_port → $be_url"
-    nohup "$BIN" -url "$be_url" -default-model "$be_default_model" -key "$be_api_key" -port "$be_port" > "/tmp/codex-converter-$be_name.log" 2>&1 &
+    nohup "$BIN" -url "$be_url" -default-model "$be_default_model" -key "$be_api_key" -port "$be_port" -timeout 300s > "/tmp/codex-converter-$be_name.log" 2>&1 &
     sleep 0.4
     if ! kill -0 $! 2>/dev/null; then
         echo "ERROR: $be_name converter failed. Log:"
